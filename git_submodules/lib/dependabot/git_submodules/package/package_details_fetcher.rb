@@ -41,18 +41,26 @@ module Dependabot
         def available_versions
           versions_metadata = T.let(fetch_tags_and_release_date, T.nilable(T::Array[GitTagWithDetail]))
 
-          # as git submodules do not have versions (refs/tags are used instead), we use a pseudo version as placeholder
-          pseudo_version = 1.0
-
           # we fallback to the git based tag info if no versions metadata is available
           if versions_metadata&.empty?
             versions_metadata = T.let(fetch_latest_tag_info,
                                       T.nilable(T::Array[GitTagWithDetail]))
           end
 
+          # as git submodules do not have versions (refs/tags are used instead), we use a pseudo version as placeholder
+          pseudo_version = T.must(versions_metadata&.length) + 1
+
           releases = T.must(versions_metadata).map do |version_details|
+            version = if GitSubmodules::Version.valid_semver?(version_details.tag)
+                        GitSubmodules::Version.new(version_details.tag)
+                      elsif version_details.tag.start_with?("v") &&
+                            GitSubmodules::Version.valid_semver?(T.must(version_details.tag[1..]))
+                        GitSubmodules::Version.new(version_details.tag[1..])
+                      else
+                        GitSubmodules::Version.new("0.0.0-0.#{pseudo_version -= 1}")
+                      end
             Dependabot::Package::PackageRelease.new(
-              version: GitSubmodules::Version.new((pseudo_version += 1).to_s),
+              version: version,
               tag: version_details.tag,
               released_at: version_details.release_date ? Time.parse(T.must(version_details.release_date)) : nil
             )
@@ -80,6 +88,8 @@ module Dependabot
           parsed_results
         end
 
+        MAX_COMMITS_TO_FETCH = T.let(5 * Dependabot::GitMetadataFetcher::MAX_COMMITS_PER_PAGE, Integer)
+
         sig { returns(T::Array[GitTagWithDetail]) }
         def fetch_tags_and_release_date
           parsed_results = T.let([], T::Array[GitTagWithDetail])
@@ -92,22 +102,43 @@ module Dependabot
               credentials: credentials
             )
 
-            response = client.ref_details_for_pinned_ref
-
-            unless response.status == 200
-              Dependabot.logger.error("Error while fetching details for #{dependency.name} " \
-                                      "Detail : #{response.body}")
+            sha_to_tags = client.tags.each_with_object({}) do |tag, h|
+              sha = tag.commit_sha
+              h[sha] ||= []
+              h[sha] << tag.name
             end
 
-            return parsed_results unless response.status == 200
+            sha = T.let(nil, T.nilable(String))
+            while parsed_results.length <= MAX_COMMITS_TO_FETCH
+              response = sha.nil? ? client.ref_details_for_pinned_ref : client.ref_details(sha)
 
-            releases = JSON.parse(response.body)
+              unless response.status == 200
+                Dependabot.logger.error("Error while fetching details for #{dependency.name} " \
+                                        "Detail : #{response.body}")
+              end
 
-            parsed_results = releases.map do |release|
-              GitTagWithDetail.new(
-                tag: release["sha"],
-                release_date: release["commit"]["committer"]["date"]
-              )
+              return parsed_results unless response.status == 200
+
+              commits = JSON.parse(response.body)
+              break if commits.length <= (sha.nil? ? 0 : 1)
+
+              commits.each_with_index do |release, index|
+                next if index == 0 && !sha.nil?  # Skip the first commit if we are in a paginated request
+                sha = release["sha"]
+                release_date = release["commit"]["committer"]["date"]
+                Array(sha_to_tags[sha]).each do |tag_name|
+                  parsed_results << GitTagWithDetail.new(
+                    tag: tag_name,
+                    release_date: release_date
+                  )
+                end
+                parsed_results << GitTagWithDetail.new(
+                  tag: sha,
+                  release_date: release_date
+                )
+              end
+
+              break if commits.length < Dependabot::GitMetadataFetcher::MAX_COMMITS_PER_PAGE
             end
 
             parsed_results
